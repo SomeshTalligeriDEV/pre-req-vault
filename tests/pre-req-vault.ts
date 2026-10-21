@@ -7,52 +7,62 @@ import {
   PublicKey,
   SystemProgram,
 } from "@solana/web3.js";
-import NodeWallet from "@anchor-lang/core/dist/cjs/nodewallet";
 import { BN } from "bn.js";
 import { expect } from "chai";
 
 const commitement: Commitment = "confirmed";
+const registrationIdl: anchor.Idl = require("../idls/registration.json");
+const registrationCoder = new anchor.BorshAccountsCoder(registrationIdl);
 
-describe("pre-req-vault", () => {
+describe("pre-req-vault", function () {
+  this.bail(true);
+  this.retries(0);
+  let registrationVerified = false;
   const confirmTx = async (signature: string) => {
     console.log(`Transaction signature: ${signature}`);
-    const latestBlockhash = await anchor
-      .getProvider()
-      .connection.getLatestBlockhash();
-    await anchor.getProvider().connection.confirmTransaction(
-      {
-        signature,
-        ...latestBlockhash,
-      },
-      commitement,
-    );
   };
 
-  const provider = anchor.AnchorProvider.env();
+  const environmentProvider = anchor.AnchorProvider.env();
+  const provider = new anchor.AnchorProvider(
+    new anchor.web3.Connection(
+      environmentProvider.connection.rpcEndpoint,
+      "confirmed"
+    ),
+    environmentProvider.wallet,
+    { commitment: "confirmed", preflightCommitment: "confirmed" }
+  );
   anchor.setProvider(provider);
 
   const program = anchor.workspace.preReqVault as Program<PreReqVault>;
   const user = provider.wallet.publicKey;
+  const applicationProgram = new PublicKey(registrationIdl.address);
+  const [applicationAccount] = PublicKey.findProgramAddressSync(
+    [Buffer.from("prereqs"), user.toBuffer()],
+    applicationProgram
+  );
 
   // Derive PDAs
 
   const [vaultStatePda, stateBump] = PublicKey.findProgramAddressSync(
     [Buffer.from("state"), user.toBuffer()],
-    program.programId,
+    program.programId
   );
 
   const [vaultPda, vaultBump] = PublicKey.findProgramAddressSync(
     [Buffer.from("vault"), vaultStatePda.toBuffer()],
-    program.programId,
+    program.programId
   );
 
-  //   before(async () => {
-  //     const sig = await provider.connection.requestAirdrop(
-  //       user,
-  //       10 * LAMPORTS_PER_SOL,
-  //     );
-  //     await confirmTx(sig);
-  //   });
+  before(async () => {
+    const existingRegistration = await provider.connection.getAccountInfo(
+      applicationAccount,
+      commitement
+    );
+    expect(
+      existingRegistration,
+      "This wallet already has a registration account; stop before sending transactions."
+    ).to.be.null;
+  });
 
   it("Initialize the vault", async () => {
     const tx = await program.methods
@@ -88,7 +98,7 @@ describe("pre-req-vault", () => {
       })
       .rpc();
 
-    confirmTx(tx);
+    await confirmTx(tx);
 
     const finalBalanceVault = await provider.connection.getBalance(vaultPda);
     const finalBalanceUser = await provider.connection.getBalance(user);
@@ -103,15 +113,6 @@ describe("pre-req-vault", () => {
     const initialVaultBalance = await provider.connection.getBalance(vaultPda);
     const intialUserBalance = await provider.connection.getBalance(user);
 
-    const applicationProgram = new PublicKey(
-      "TRBZyQHB3m68FGeVsqTK39Wm4xejadjVhP5MAZaKWDM",
-    );
-
-    const applicationAccount = PublicKey.findProgramAddressSync(
-      [Buffer.from("prereqs"), user.toBuffer()],
-      applicationProgram,
-    )[0];
-
     const tx = await program.methods
       .withdraw(new BN(withdrawAmount))
       .accountsStrict({
@@ -124,7 +125,36 @@ describe("pre-req-vault", () => {
       })
       .rpc();
 
-    confirmTx(tx);
+    await confirmTx(tx);
+
+    const registrationInfo = await provider.connection.getAccountInfo(
+      applicationAccount,
+      commitement
+    );
+    expect(registrationInfo, "Withdrawal must create the registration account")
+      .to.not.be.null;
+    expect(registrationInfo!.owner.toBase58()).to.equal(
+      applicationProgram.toBase58()
+    );
+    // decode checks the account discriminator from the supplied IDL.
+    const registration = registrationCoder.decode(
+      "ApplicationAccount",
+      registrationInfo!.data
+    );
+    expect(registration.github).to.equal("SomeshTalligeriDEV");
+    expect(registration.user.toBase58()).to.equal(user.toBase58());
+    registrationVerified = true;
+    console.log(
+      "Verified registration:",
+      JSON.stringify({
+        address: applicationAccount.toBase58(),
+        user: registration.user.toBase58(),
+        github: registration.github,
+        bump: registration.bump,
+        pre_req_ts: registration.pre_req_ts,
+        pre_req_rs: registration.pre_req_rs,
+      })
+    );
 
     const finalBalanceVault = await provider.connection.getBalance(vaultPda);
     const finalBalanceUser = await provider.connection.getBalance(user);
@@ -134,6 +164,10 @@ describe("pre-req-vault", () => {
   });
 
   it(" Close the vault and withdraw all the funds", async () => {
+    expect(
+      registrationVerified,
+      "Verify registration before closing the vault"
+    ).to.equal(true);
     const initialUserBalance = await provider.connection.getBalance(user);
 
     const tx = await program.methods
@@ -146,12 +180,12 @@ describe("pre-req-vault", () => {
       })
       .rpc();
 
-    confirmTx(tx);
+    await confirmTx(tx);
 
     expect(await provider.connection.getBalance(vaultPda)).to.equal(0);
 
     const vaultStateInfo = await provider.connection.getAccountInfo(
-      vaultStatePda,
+      vaultStatePda
     );
     expect(vaultStateInfo).to.be.null;
 
